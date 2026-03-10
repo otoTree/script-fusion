@@ -150,6 +150,7 @@ def process_story_dir(
     story_meta = build_story_context(story_dir=story_dir)
     chapter_records = []
     all_chapter_entities = []
+    llm_errors = []
 
     for chapter_file in chapter_files:
         if not wait_for_task_control(control):
@@ -171,24 +172,29 @@ def process_story_dir(
         entities = llm_result.get("entities", [])
         outline = llm_result.get("outline", {})
         if not entities:
-            raise AIAPIError(f"章节未提取到实体: {chapter_file.name}")
+            llm_errors.append({"chapter_file": chapter_file.name, "error": "no_entities"})
+            continue
         if not any(outline.values()):
             raise AIAPIError(f"章节骨架为空: {chapter_file.name}")
 
         chapter_records.append({"chapter_file": chapter_file, "chapter_title": chapter_title, "outline": outline})
         all_chapter_entities.extend(entities)
 
-    merged_entities = llm_merge_entities(
-        chapter_entities=all_chapter_entities,
-        temperature=analysis_temperature,
-        max_tokens=analysis_max_tokens,
-    )
-    name_map = llm_build_name_map(
-        entities=merged_entities,
-        max_renames=max_renames,
-        temperature=analysis_temperature,
-        max_tokens=analysis_max_tokens,
-    )
+    if all_chapter_entities:
+        merged_entities = llm_merge_entities(
+            chapter_entities=all_chapter_entities,
+            temperature=analysis_temperature,
+            max_tokens=analysis_max_tokens,
+        )
+        name_map = llm_build_name_map(
+            entities=merged_entities,
+            max_renames=max_renames,
+            temperature=analysis_temperature,
+            max_tokens=analysis_max_tokens,
+        )
+    else:
+        merged_entities = []
+        name_map = {}
 
     target_dir = story_dir / target_dir_name
     if not dry_run:
@@ -258,6 +264,7 @@ def process_story_dir(
         renamed_entity_count=len(name_map),
         chapter_reports=chapter_reports,
     )
+    summary["llm_error_count"] = len(llm_errors)
 
     if not dry_run:
         (target_dir / "name_map.json").write_text(json.dumps(name_map, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -274,7 +281,7 @@ def process_story_dir(
                 {
                     "summary": summary,
                     "chapters": chapter_reports,
-                    "llm_errors": [],
+                    "llm_errors": llm_errors,
                 },
                 ensure_ascii=False,
                 indent=2,
