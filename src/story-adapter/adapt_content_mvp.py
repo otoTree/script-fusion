@@ -4,10 +4,13 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 
 PROJECT_SRC = Path(__file__).resolve().parents[1]
 if str(PROJECT_SRC) not in sys.path:
     sys.path.append(str(PROJECT_SRC))
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from story_processing import collect_story_dirs
 from task_manager import AdaptTaskManager, TaskStatus
@@ -16,11 +19,21 @@ from task_manager import AdaptTaskManager, TaskStatus
 DEFAULT_OUTPUT_DIR = "/Users/hjr/Desktop/script-fusion/src/wattpad-scraper/output"
 
 
+def _log(msg):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[ADAPT {ts}] {msg}")
+
+
 def run_batch(args, output_dir):
+    _log(f"开始批处理，输出目录={output_dir}")
     story_dirs = collect_story_dirs(output_dir)
+    _log(f"发现作品目录数量={len(story_dirs)}")
     if args.story_folder:
         chosen = set(args.story_folder)
         story_dirs = [story_dir for story_dir in story_dirs if story_dir.name in chosen]
+        _log(f"按 story_folder 过滤后数量={len(story_dirs)}，目标={sorted(chosen)}")
+    else:
+        _log("未设置 story_folder 过滤")
     manager = AdaptTaskManager(
         max_workers=args.workers,
         target_dir_name=args.target_dir_name,
@@ -32,10 +45,20 @@ def run_batch(args, output_dir):
         analysis_max_tokens=args.analysis_max_tokens,
         rewrite_max_tokens=args.rewrite_max_tokens,
     )
-    task_ids = [manager.publish(story_dir=story_dir) for story_dir in story_dirs]
+    task_ids = []
+    for story_dir in story_dirs:
+        task_id = manager.publish(story_dir=story_dir)
+        task_ids.append(task_id)
+        _log(f"已发布任务 story={story_dir.name} task_id={task_id}")
+    _log(f"总计发布任务数={len(task_ids)}")
     try:
+        last_log_ts = 0.0
         while True:
             tasks = manager.list_tasks()
+            status_counts = {}
+            for item in tasks:
+                status = item.get("status", "").lower()
+                status_counts[status] = status_counts.get(status, 0) + 1
             active = [
                 item
                 for item in tasks
@@ -47,6 +70,11 @@ def run_batch(args, output_dir):
                     TaskStatus.STOPPING.value,
                 }
             ]
+            now = time.time()
+            if now - last_log_ts >= max(0.2, args.poll_interval):
+                snapshot = " ".join([f"{k}={v}" for k, v in sorted(status_counts.items())]) or "无任务"
+                _log(f"状态快照: {snapshot}")
+                last_log_ts = now
             if not active:
                 break
             time.sleep(max(0.2, args.poll_interval))
@@ -87,6 +115,14 @@ def run_batch(args, output_dir):
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"已写入批处理报告: {report_path}")
 
+    _log(
+        f"完成批处理 total={report['summary']['total_stories']} "
+        f"ok={report['summary']['ok_stories']} "
+        f"skipped={report['summary']['skipped_stories']} "
+        f"stopped={report['summary']['stopped_stories']} "
+        f"failed={report['summary']['failed_stories']} "
+        f"destroyed={report['summary']['destroyed_stories']}"
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -226,6 +262,17 @@ def main():
     if not output_dir.exists() or not output_dir.is_dir():
         raise SystemExit(f"输出目录不存在或不是目录: {output_dir}")
 
+    _log(
+        f"参数: mode={args.mode} output_dir={output_dir} target_dir_name={args.target_dir_name} "
+        f"workers={args.workers} max_renames={args.max_renames} "
+        f"analysis_temp={args.analysis_temperature} rewrite_temp={args.rewrite_temperature} "
+        f"analysis_max_tokens={args.analysis_max_tokens} rewrite_max_tokens={args.rewrite_max_tokens} "
+        f"dry_run={args.dry_run} force={args.force}"
+    )
+    if args.story_folder:
+        _log(f"仅处理作品: {sorted(set(args.story_folder))}")
+    else:
+        _log("处理全部作品")
     if args.mode == "batch":
         run_batch(args=args, output_dir=output_dir)
     else:

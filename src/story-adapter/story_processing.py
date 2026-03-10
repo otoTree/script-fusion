@@ -175,15 +175,7 @@ def process_story_dir(
         if not any(outline.values()):
             raise AIAPIError(f"章节骨架为空: {chapter_file.name}")
 
-        chapter_records.append(
-            {
-                "chapter_file": chapter_file,
-                "chapter_title": chapter_title,
-                "source_text": source_text,
-                "outline": outline,
-                "entities": entities,
-            }
-        )
+        chapter_records.append({"chapter_file": chapter_file, "chapter_title": chapter_title, "outline": outline})
         all_chapter_entities.extend(entities)
 
     merged_entities = llm_merge_entities(
@@ -217,7 +209,7 @@ def process_story_dir(
                 reason="task_cancelled_before_rewrite",
             )
         chapter_file = record["chapter_file"]
-        source_text = record["source_text"]
+        source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
         chapter_title = record["chapter_title"]
         outline = record["outline"]
         if progress_callback:
