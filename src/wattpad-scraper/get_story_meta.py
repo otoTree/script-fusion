@@ -4,6 +4,8 @@ import json
 import re
 import argparse
 import os
+import random
+import time
 
 def parse_cookie_string(cookie_str):
     """将从浏览器复制的 Cookie 字符串解析为字典"""
@@ -54,7 +56,47 @@ def extract_chapters_from_soup(soup):
                 
     return chapters
 
-def get_wattpad_metadata(url, cookies_dict=None):
+
+def _parse_retry_after(value):
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_with_backoff(request_func, max_retries, base_delay, max_delay, jitter):
+    for attempt in range(max_retries + 1):
+        try:
+            response = request_func()
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt >= max_retries:
+                    return response
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                sleep_seconds = retry_after if retry_after is not None else min(max_delay, base_delay * (2 ** attempt))
+                sleep_seconds += random.uniform(0, jitter)
+                print(f"请求被限流或服务繁忙，{sleep_seconds:.2f}s 后重试...")
+                time.sleep(sleep_seconds)
+                continue
+            return response
+        except requests.exceptions.RequestException:
+            if attempt >= max_retries:
+                raise
+            sleep_seconds = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, jitter)
+            print(f"请求异常，{sleep_seconds:.2f}s 后重试...")
+            time.sleep(sleep_seconds)
+    return None
+
+def get_wattpad_metadata(
+    url,
+    cookies_dict=None,
+    min_interval=0.8,
+    max_retries=4,
+    base_delay=1.2,
+    max_delay=20.0,
+    jitter=0.5,
+):
     # 使用用户提供的 Headers
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
@@ -80,6 +122,21 @@ def get_wattpad_metadata(url, cookies_dict=None):
         }
 
     print(f"正在请求页面: {url}...")
+    last_request_at = [0.0]
+
+    def controlled_get(request_url, timeout):
+        elapsed = time.time() - last_request_at[0]
+        if elapsed < min_interval:
+            time.sleep((min_interval - elapsed) + random.uniform(0, jitter))
+        response = _request_with_backoff(
+            lambda: requests.get(request_url, headers=headers, cookies=cookies_dict, timeout=timeout),
+            max_retries=max_retries,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter=jitter,
+        )
+        last_request_at[0] = time.time()
+        return response
     
     # 提取 Story ID
     story_id_match = re.search(r'story/(\d+)', url)
@@ -87,7 +144,7 @@ def get_wattpad_metadata(url, cookies_dict=None):
 
     try:
         # 发送 GET 请求
-        response = requests.get(url, headers=headers, cookies=cookies_dict, timeout=10)
+        response = controlled_get(url, timeout=10)
         response.raise_for_status()
         
         # 尝试使用 lxml 解析，如果不可用则回退到内置的 html.parser
@@ -114,7 +171,7 @@ def get_wattpad_metadata(url, cookies_dict=None):
             print(f"尝试使用 API 获取章节列表 (Story ID: {story_id})...")
             api_url = f"https://www.wattpad.com/api/v3/stories/{story_id}?fields=id,title,description,parts(id,title,url,wordCount,commentCount,voteCount,readCount)"
             try:
-                api_response = requests.get(api_url, headers=headers, cookies=cookies_dict, timeout=5)
+                api_response = controlled_get(api_url, timeout=5)
                 if api_response.status_code == 200:
                     api_data = api_response.json()
                     parts = api_data.get('parts', [])

@@ -5,6 +5,7 @@ import re
 import argparse
 import os
 import time
+import random
 
 def parse_cookie_string(cookie_str):
     """将从浏览器复制的 Cookie 字符串解析为字典"""
@@ -19,7 +20,50 @@ def parse_cookie_string(cookie_str):
             cookies[key] = value
     return cookies
 
-def get_chapter_content(url, cookies_dict=None, pause_event=None, cancel_event=None, status_callback=None):
+def _parse_retry_after(value):
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_with_backoff(request_func, max_retries, base_delay, max_delay, jitter):
+    for attempt in range(max_retries + 1):
+        try:
+            response = request_func()
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt >= max_retries:
+                    return response
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                sleep_seconds = retry_after if retry_after is not None else min(max_delay, base_delay * (2 ** attempt))
+                sleep_seconds += random.uniform(0, jitter)
+                print(f"请求被限流或服务繁忙，{sleep_seconds:.2f}s 后重试...")
+                time.sleep(sleep_seconds)
+                continue
+            return response
+        except requests.exceptions.RequestException:
+            if attempt >= max_retries:
+                raise
+            sleep_seconds = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, jitter)
+            print(f"请求异常，{sleep_seconds:.2f}s 后重试...")
+            time.sleep(sleep_seconds)
+    return None
+
+
+def get_chapter_content(
+    url,
+    cookies_dict=None,
+    pause_event=None,
+    cancel_event=None,
+    status_callback=None,
+    min_interval=0.8,
+    max_retries=4,
+    base_delay=1.2,
+    max_delay=20.0,
+    jitter=0.5,
+):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -38,7 +82,22 @@ def get_chapter_content(url, cookies_dict=None, pause_event=None, cancel_event=N
             'ff': '1',
         }
 
-    # 提取 Part ID
+    last_request_at = [0.0]
+
+    def controlled_get(request_url, timeout):
+        elapsed = time.time() - last_request_at[0]
+        if elapsed < min_interval:
+            time.sleep((min_interval - elapsed) + random.uniform(0, jitter))
+        response = _request_with_backoff(
+            lambda: requests.get(request_url, headers=headers, cookies=cookies_dict, timeout=timeout),
+            max_retries=max_retries,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter=jitter,
+        )
+        last_request_at[0] = time.time()
+        return response
+
     part_id_match = re.search(r'/(\d+)-', url)
     if not part_id_match:
         # 尝试匹配结尾是数字的情况
@@ -61,7 +120,7 @@ def get_chapter_content(url, cookies_dict=None, pause_event=None, cancel_event=N
     max_pages = 1
     try:
         print(f"正在获取章节元数据...")
-        response = requests.get(api_meta_url, headers=headers, cookies=cookies_dict, timeout=10)
+        response = controlled_get(api_meta_url, timeout=10)
         response.raise_for_status()
         meta_data = response.json()
         max_pages = meta_data.get('pages', 1)
@@ -87,7 +146,7 @@ def get_chapter_content(url, cookies_dict=None, pause_event=None, cancel_event=N
             status_callback(page_num, max_pages)
         
         try:
-            response = requests.get(page_url, headers=headers, cookies=cookies_dict, timeout=10)
+            response = controlled_get(page_url, timeout=10)
             if response.status_code == 404 or not response.text.strip() or "Something went wrong" in response.text:
                 print(f"  第 {page_num} 页没有更多内容或出错")
                 break
