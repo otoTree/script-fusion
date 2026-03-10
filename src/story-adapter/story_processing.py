@@ -192,6 +192,7 @@ def process_story_dir(
     llm_errors = []
     merged_entities = []
     name_map = {}
+
     try:
         for chapter_file in chapter_files:
             if not wait_for_task_control(control):
@@ -214,38 +215,55 @@ def process_story_dir(
                     chapter_outlines=chapter_outlines,
                 )
                 return summary
+
             source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
             chapter_title = chapter_file.stem
-            llm_result = llm_extract_chapter(
-                chapter_title=chapter_title,
-                chapter_text=source_text,
-                story_meta=story_meta,
-                temperature=analysis_temperature,
-                max_tokens=analysis_max_tokens,
-            )
+            try:
+                llm_result = llm_extract_chapter(
+                    chapter_title=chapter_title,
+                    chapter_text=source_text,
+                    story_meta=story_meta,
+                    temperature=analysis_temperature,
+                    max_tokens=analysis_max_tokens,
+                )
+            except AIAPIError as error:
+                llm_errors.append({"chapter_file": chapter_file.name, "stage": "extract", "error": str(error)})
+                continue
+
             entities = llm_result.get("entities", [])
             outline = llm_result.get("outline", {})
-            if not entities:
-                llm_errors.append({"chapter_file": chapter_file.name, "error": "no_entities"})
-                continue
             if not any(outline.values()):
-                raise AIAPIError(f"章节骨架为空: {chapter_file.name}")
+                llm_errors.append({"chapter_file": chapter_file.name, "stage": "extract", "error": "empty_outline"})
+                continue
 
             chapter_records.append({"chapter_file": chapter_file, "chapter_title": chapter_title, "outline": outline})
             all_chapter_entities.extend(entities)
 
         if all_chapter_entities:
-            merged_entities = llm_merge_entities(
-                chapter_entities=all_chapter_entities,
-                temperature=analysis_temperature,
-                max_tokens=analysis_max_tokens,
-            )
-            name_map = llm_build_name_map(
-                entities=merged_entities,
-                max_renames=max_renames,
-                temperature=analysis_temperature,
-                max_tokens=analysis_max_tokens,
-            )
+            try:
+                merged_entities = llm_merge_entities(
+                    chapter_entities=all_chapter_entities,
+                    temperature=analysis_temperature,
+                    max_tokens=analysis_max_tokens,
+                )
+            except AIAPIError as error:
+                merged_entities = []
+                llm_errors.append({"chapter_file": "", "stage": "merge_entities", "error": str(error)})
+
+            if merged_entities:
+                try:
+                    name_map = llm_build_name_map(
+                        entities=merged_entities,
+                        max_renames=max_renames,
+                        temperature=analysis_temperature,
+                        max_tokens=analysis_max_tokens,
+                    )
+                except AIAPIError as error:
+                    name_map = {}
+                    llm_errors.append({"chapter_file": "", "stage": "build_name_map", "error": str(error)})
+
+        if not dry_run:
+            target_dir.mkdir(parents=True, exist_ok=True)
 
         for index, record in enumerate(chapter_records, start=1):
             if not wait_for_task_control(control):
@@ -270,6 +288,7 @@ def process_story_dir(
                     chapter_outlines=chapter_outlines,
                 )
                 return summary
+
             chapter_file = record["chapter_file"]
             source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
             chapter_title = record["chapter_title"]
@@ -282,15 +301,29 @@ def process_story_dir(
                         "current_chapter": chapter_file.name,
                     }
                 )
-            adapted_text = llm_rewrite_chapter(
-                chapter_title=chapter_title,
-                source_text=source_text,
-                outline=outline,
-                name_map=name_map,
-                story_meta=story_meta,
-                temperature=rewrite_temperature,
-                max_tokens=rewrite_max_tokens,
-            )
+
+            try:
+                adapted_text = llm_rewrite_chapter(
+                    chapter_title=chapter_title,
+                    source_text=source_text,
+                    outline=outline,
+                    name_map=name_map,
+                    story_meta=story_meta,
+                    temperature=rewrite_temperature,
+                    max_tokens=rewrite_max_tokens,
+                )
+            except AIAPIError as error:
+                llm_errors.append({"chapter_file": chapter_file.name, "stage": "rewrite", "error": str(error)})
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "total_chapters": len(chapter_files),
+                            "completed_chapters": index,
+                            "current_chapter": chapter_file.name,
+                        }
+                    )
+                continue
+
             overlap_ratio = calc_ngram_overlap_ratio(source_text, adapted_text, n=5)
             chapter_outlines.append({"chapter_file": chapter_file.name, "outline": outline})
             chapter_reports.append(
@@ -302,7 +335,6 @@ def process_story_dir(
                 }
             )
             if not dry_run:
-                target_dir.mkdir(parents=True, exist_ok=True)
                 (target_dir / chapter_file.name).write_text(adapted_text, encoding="utf-8")
             if progress_callback:
                 progress_callback(

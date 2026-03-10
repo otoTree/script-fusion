@@ -1,7 +1,51 @@
 import json
+import random
 import re
+import time
 
 from util.llm import AIAPIError, call_ai_chat_completion, extract_first_message_content
+
+
+def _extract_retry_after_seconds(error):
+    message = str(error).lower()
+    patterns = [
+        r"retry-after[:=\s]+(\d+(?:\.\d+)?)",
+        r"retry after[:=\s]+(\d+(?:\.\d+)?)",
+        r"after\s+(\d+(?:\.\d+)?)\s*s",
+    ]
+    for pattern in patterns:
+        matched = re.search(pattern, message)
+        if matched:
+            try:
+                return max(0.0, float(matched.group(1)))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _is_retryable_error(error):
+    message = str(error).lower()
+    retryable_signals = [
+        "timeout",
+        "timed out",
+        "read timed out",
+        "超时",
+        "apitimeouterror",
+        "connection",
+        "429",
+        "rate limit",
+        "too many requests",
+        "500",
+        "502",
+        "503",
+        "504",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "temporarily unavailable",
+        "overloaded",
+    ]
+    return any(signal in message for signal in retryable_signals)
 
 
 def parse_json_payload(content):
@@ -19,10 +63,25 @@ def parse_json_payload(content):
         raise
 
 
-def call_llm_json(messages, temperature, max_tokens):
-    result = call_ai_chat_completion(messages=messages, temperature=temperature, max_tokens=max_tokens)
-    content = extract_first_message_content(result)
-    return parse_json_payload(content)
+def call_llm_json(messages, temperature, max_tokens, base_delay=1.2, max_delay=20.0, jitter=0.5):
+    attempt = 0
+    while True:
+        try:
+            result = call_ai_chat_completion(messages=messages, temperature=temperature, max_tokens=max_tokens)
+            content = extract_first_message_content(result)
+            return parse_json_payload(content)
+        except AIAPIError as error:
+            if not _is_retryable_error(error):
+                raise
+            retry_after = _extract_retry_after_seconds(error)
+            sleep_seconds = (
+                retry_after
+                if retry_after is not None
+                else min(max_delay, base_delay * (2**attempt))
+            )
+            sleep_seconds += random.uniform(0, jitter)
+            time.sleep(sleep_seconds)
+            attempt += 1
 
 
 def llm_extract_chapter(chapter_title, chapter_text, story_meta, temperature, max_tokens):
@@ -38,6 +97,7 @@ def llm_extract_chapter(chapter_title, chapter_text, story_meta, temperature, ma
             "content": (
                 "你是小说编辑助手。请只输出 JSON，不要输出任何额外文本。"
                 "目标是对授权文本做原创改编准备。"
+                "如果章节中没有可提取实体，entities 可以返回空数组。"
                 "返回结构必须是："
                 '{"entities":[{"name":"","type":"person|location|organization|other","aliases":[],"mentions":1}],'
                 '"outline":{"opening":"","conflict":"","turning_point":"","ending":""}}'
@@ -177,6 +237,7 @@ def llm_rewrite_chapter(chapter_title, source_text, outline, name_map, story_met
             "role": "system",
             "content": (
                 "你是小说改编助手。对授权文本进行原创改编，保留剧情骨架但重新组织表达。"
+                "改写语言必须与 source_text 原文语言一致，不要把英文改成中文，也不要把中文改成英文。"
                 "必须使用 name_map 中的新名字。"
                 "输出 JSON："
                 '{"adapted_text":""}'
