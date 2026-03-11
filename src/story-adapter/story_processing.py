@@ -98,6 +98,42 @@ def load_existing_summary(story_dir, target_dir_name):
     return summary
 
 
+def persist_artifacts(
+    target_dir,
+    dry_run,
+    summary,
+    chapter_reports,
+    llm_errors,
+    name_map,
+    merged_entities,
+    chapter_outlines,
+):
+    if dry_run:
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "name_map.json").write_text(json.dumps(name_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    (target_dir / "chapter_outline.json").write_text(
+        json.dumps(chapter_outlines, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (target_dir / "entity_merge.json").write_text(
+        json.dumps({"entities": merged_entities}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (target_dir / "adapt_report.json").write_text(
+        json.dumps(
+            {
+                "summary": summary,
+                "chapters": chapter_reports,
+                "llm_errors": llm_errors,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def process_story_dir(
     story_dir,
     target_dir_name,
@@ -147,145 +183,175 @@ def process_story_dir(
     if progress_callback:
         progress_callback({"total_chapters": len(chapter_files), "completed_chapters": 0, "current_chapter": ""})
 
+    target_dir = story_dir / target_dir_name
     story_meta = build_story_context(story_dir=story_dir)
     chapter_records = []
     all_chapter_entities = []
-    llm_errors = []
-
-    for chapter_file in chapter_files:
-        if not wait_for_task_control(control):
-            return build_task_summary(
-                story_dir=story_dir,
-                status="stopped",
-                chapter_count=len(chapter_files),
-                reason="task_cancelled_before_extract",
-            )
-        source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
-        chapter_title = chapter_file.stem
-        llm_result = llm_extract_chapter(
-            chapter_title=chapter_title,
-            chapter_text=source_text,
-            story_meta=story_meta,
-            temperature=analysis_temperature,
-            max_tokens=analysis_max_tokens,
-        )
-        entities = llm_result.get("entities", [])
-        outline = llm_result.get("outline", {})
-        if not entities:
-            llm_errors.append({"chapter_file": chapter_file.name, "error": "no_entities"})
-            continue
-        if not any(outline.values()):
-            raise AIAPIError(f"章节骨架为空: {chapter_file.name}")
-
-        chapter_records.append({"chapter_file": chapter_file, "chapter_title": chapter_title, "outline": outline})
-        all_chapter_entities.extend(entities)
-
-    if all_chapter_entities:
-        merged_entities = llm_merge_entities(
-            chapter_entities=all_chapter_entities,
-            temperature=analysis_temperature,
-            max_tokens=analysis_max_tokens,
-        )
-        name_map = llm_build_name_map(
-            entities=merged_entities,
-            max_renames=max_renames,
-            temperature=analysis_temperature,
-            max_tokens=analysis_max_tokens,
-        )
-    else:
-        merged_entities = []
-        name_map = {}
-
-    target_dir = story_dir / target_dir_name
-    if not dry_run:
-        target_dir.mkdir(parents=True, exist_ok=True)
-
     chapter_outlines = []
     chapter_reports = []
-
-    for index, record in enumerate(chapter_records, start=1):
-        if not wait_for_task_control(control):
-            return build_task_summary(
-                story_dir=story_dir,
-                status="stopped",
-                chapter_count=len(chapter_files),
-                target_dir=target_dir,
-                renamed_entity_count=len(name_map),
-                chapter_reports=chapter_reports,
-                reason="task_cancelled_before_rewrite",
+    llm_errors = []
+    merged_entities = []
+    name_map = {}
+    try:
+        for chapter_file in chapter_files:
+            if not wait_for_task_control(control):
+                summary = build_task_summary(
+                    story_dir=story_dir,
+                    status="stopped",
+                    chapter_count=len(chapter_files),
+                    target_dir=target_dir,
+                    reason="task_cancelled_before_extract",
+                )
+                summary["llm_error_count"] = len(llm_errors)
+                persist_artifacts(
+                    target_dir=target_dir,
+                    dry_run=dry_run,
+                    summary=summary,
+                    chapter_reports=chapter_reports,
+                    llm_errors=llm_errors,
+                    name_map=name_map,
+                    merged_entities=merged_entities,
+                    chapter_outlines=chapter_outlines,
+                )
+                return summary
+            source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
+            chapter_title = chapter_file.stem
+            llm_result = llm_extract_chapter(
+                chapter_title=chapter_title,
+                chapter_text=source_text,
+                story_meta=story_meta,
+                temperature=analysis_temperature,
+                max_tokens=analysis_max_tokens,
             )
-        chapter_file = record["chapter_file"]
-        source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
-        chapter_title = record["chapter_title"]
-        outline = record["outline"]
-        if progress_callback:
-            progress_callback(
+            entities = llm_result.get("entities", [])
+            outline = llm_result.get("outline", {})
+            if not entities:
+                llm_errors.append({"chapter_file": chapter_file.name, "error": "no_entities"})
+                continue
+            if not any(outline.values()):
+                raise AIAPIError(f"章节骨架为空: {chapter_file.name}")
+
+            chapter_records.append({"chapter_file": chapter_file, "chapter_title": chapter_title, "outline": outline})
+            all_chapter_entities.extend(entities)
+
+        if all_chapter_entities:
+            merged_entities = llm_merge_entities(
+                chapter_entities=all_chapter_entities,
+                temperature=analysis_temperature,
+                max_tokens=analysis_max_tokens,
+            )
+            name_map = llm_build_name_map(
+                entities=merged_entities,
+                max_renames=max_renames,
+                temperature=analysis_temperature,
+                max_tokens=analysis_max_tokens,
+            )
+
+        for index, record in enumerate(chapter_records, start=1):
+            if not wait_for_task_control(control):
+                summary = build_task_summary(
+                    story_dir=story_dir,
+                    status="stopped",
+                    chapter_count=len(chapter_files),
+                    target_dir=target_dir,
+                    renamed_entity_count=len(name_map),
+                    chapter_reports=chapter_reports,
+                    reason="task_cancelled_before_rewrite",
+                )
+                summary["llm_error_count"] = len(llm_errors)
+                persist_artifacts(
+                    target_dir=target_dir,
+                    dry_run=dry_run,
+                    summary=summary,
+                    chapter_reports=chapter_reports,
+                    llm_errors=llm_errors,
+                    name_map=name_map,
+                    merged_entities=merged_entities,
+                    chapter_outlines=chapter_outlines,
+                )
+                return summary
+            chapter_file = record["chapter_file"]
+            source_text = chapter_file.read_text(encoding="utf-8", errors="ignore")
+            chapter_title = record["chapter_title"]
+            outline = record["outline"]
+            if progress_callback:
+                progress_callback(
+                    {
+                        "total_chapters": len(chapter_files),
+                        "completed_chapters": index - 1,
+                        "current_chapter": chapter_file.name,
+                    }
+                )
+            adapted_text = llm_rewrite_chapter(
+                chapter_title=chapter_title,
+                source_text=source_text,
+                outline=outline,
+                name_map=name_map,
+                story_meta=story_meta,
+                temperature=rewrite_temperature,
+                max_tokens=rewrite_max_tokens,
+            )
+            overlap_ratio = calc_ngram_overlap_ratio(source_text, adapted_text, n=5)
+            chapter_outlines.append({"chapter_file": chapter_file.name, "outline": outline})
+            chapter_reports.append(
                 {
-                    "total_chapters": len(chapter_files),
-                    "completed_chapters": index - 1,
-                    "current_chapter": chapter_file.name,
+                    "chapter_file": chapter_file.name,
+                    "source_char_count": len(source_text),
+                    "adapted_char_count": len(adapted_text),
+                    "ngram5_overlap_ratio": overlap_ratio,
                 }
             )
-        adapted_text = llm_rewrite_chapter(
-            chapter_title=chapter_title,
-            source_text=source_text,
-            outline=outline,
+            if not dry_run:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                (target_dir / chapter_file.name).write_text(adapted_text, encoding="utf-8")
+            if progress_callback:
+                progress_callback(
+                    {
+                        "total_chapters": len(chapter_files),
+                        "completed_chapters": index,
+                        "current_chapter": chapter_file.name,
+                    }
+                )
+
+        summary = build_task_summary(
+            story_dir=story_dir,
+            status="ok",
+            chapter_count=len(chapter_files),
+            target_dir=target_dir,
+            renamed_entity_count=len(name_map),
+            chapter_reports=chapter_reports,
+        )
+        summary["llm_error_count"] = len(llm_errors)
+        persist_artifacts(
+            target_dir=target_dir,
+            dry_run=dry_run,
+            summary=summary,
+            chapter_reports=chapter_reports,
+            llm_errors=llm_errors,
             name_map=name_map,
-            story_meta=story_meta,
-            temperature=rewrite_temperature,
-            max_tokens=rewrite_max_tokens,
+            merged_entities=merged_entities,
+            chapter_outlines=chapter_outlines,
         )
-        overlap_ratio = calc_ngram_overlap_ratio(source_text, adapted_text, n=5)
-        chapter_outlines.append({"chapter_file": chapter_file.name, "outline": outline})
-        chapter_reports.append(
-            {
-                "chapter_file": chapter_file.name,
-                "source_char_count": len(source_text),
-                "adapted_char_count": len(adapted_text),
-                "ngram5_overlap_ratio": overlap_ratio,
-            }
+        return summary
+    except Exception as exc:
+        summary = build_task_summary(
+            story_dir=story_dir,
+            status="failed",
+            chapter_count=len(chapter_files),
+            target_dir=target_dir,
+            renamed_entity_count=len(name_map),
+            chapter_reports=chapter_reports,
+            reason=str(exc),
         )
-        if not dry_run:
-            (target_dir / chapter_file.name).write_text(adapted_text, encoding="utf-8")
-        if progress_callback:
-            progress_callback(
-                {
-                    "total_chapters": len(chapter_files),
-                    "completed_chapters": index,
-                    "current_chapter": chapter_file.name,
-                }
-            )
-
-    summary = build_task_summary(
-        story_dir=story_dir,
-        status="ok",
-        chapter_count=len(chapter_files),
-        target_dir=target_dir,
-        renamed_entity_count=len(name_map),
-        chapter_reports=chapter_reports,
-    )
-    summary["llm_error_count"] = len(llm_errors)
-
-    if not dry_run:
-        (target_dir / "name_map.json").write_text(json.dumps(name_map, ensure_ascii=False, indent=2), encoding="utf-8")
-        (target_dir / "chapter_outline.json").write_text(
-            json.dumps(chapter_outlines, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        summary["llm_error_count"] = len(llm_errors)
+        persist_artifacts(
+            target_dir=target_dir,
+            dry_run=dry_run,
+            summary=summary,
+            chapter_reports=chapter_reports,
+            llm_errors=llm_errors,
+            name_map=name_map,
+            merged_entities=merged_entities,
+            chapter_outlines=chapter_outlines,
         )
-        (target_dir / "entity_merge.json").write_text(
-            json.dumps({"entities": merged_entities}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (target_dir / "adapt_report.json").write_text(
-            json.dumps(
-                {
-                    "summary": summary,
-                    "chapters": chapter_reports,
-                    "llm_errors": llm_errors,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    return summary
+        raise
