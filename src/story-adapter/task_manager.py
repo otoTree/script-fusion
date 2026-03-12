@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from queue import Empty, Queue
 
 from story_processing import process_story_dir
 from util.llm import AIAPIError
@@ -38,6 +39,10 @@ class AdaptTask:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     api_retry_count: int = 0
     api_retry_limit: int = 5
+    request_name: str = ""
+    request_phase: str = ""
+    request_attempt: int = 0
+    request_sleep_seconds: float = 0.0
 
 
 class AdaptTaskManager:
@@ -65,6 +70,7 @@ class AdaptTaskManager:
         self.lock = threading.RLock()
         self.tasks = {}
         self.futures = {}
+        self.event_queue = Queue()
 
     def publish(self, story_dir):
         story_path = Path(story_dir).expanduser().resolve()
@@ -75,6 +81,7 @@ class AdaptTaskManager:
         with self.lock:
             self.tasks[task_id] = task
             self.futures[task_id] = self.executor.submit(self._run_task, task_id)
+            self._emit_task_event(task, "published")
         return task_id
 
     def pause(self, task_id):
@@ -86,6 +93,7 @@ class AdaptTaskManager:
                 task.pause_event.set()
                 task.status = TaskStatus.PAUSED
                 task.updated_at = time.time()
+                self._emit_task_event(task, "paused")
                 return True
         return False
 
@@ -98,6 +106,7 @@ class AdaptTaskManager:
                 task.pause_event.clear()
                 task.status = TaskStatus.RUNNING
                 task.updated_at = time.time()
+                self._emit_task_event(task, "resumed")
                 return True
         return False
 
@@ -112,6 +121,7 @@ class AdaptTaskManager:
             task.pause_event.clear()
             task.status = TaskStatus.STOPPING
             task.updated_at = time.time()
+            self._emit_task_event(task, "stopping")
             return True
 
     def destroy(self, task_id):
@@ -125,6 +135,7 @@ class AdaptTaskManager:
             task.pause_event.clear()
             task.status = TaskStatus.DESTROYED
             task.updated_at = time.time()
+            self._emit_task_event(task, "destroyed")
             return True
 
     def restart(self, task_id):
@@ -145,6 +156,7 @@ class AdaptTaskManager:
             task.result = {}
             task.api_retry_count = 0
             self.futures[task_id] = self.executor.submit(self._run_task, task_id)
+            self._emit_task_event(task, "restarted")
             return True
 
     def get_task(self, task_id):
@@ -166,7 +178,17 @@ class AdaptTaskManager:
                 "result": task.result,
                 "api_retry_count": task.api_retry_count,
                 "api_retry_limit": task.api_retry_limit,
+                "request_name": task.request_name,
+                "request_phase": task.request_phase,
+                "request_attempt": task.request_attempt,
+                "request_sleep_seconds": task.request_sleep_seconds,
             }
+
+    def next_event(self, timeout=None):
+        try:
+            return self.event_queue.get(timeout=timeout)
+        except Empty:
+            return None
 
     def list_tasks(self):
         with self.lock:
@@ -214,6 +236,7 @@ class AdaptTaskManager:
                     "reason": error,
                 }
             task.updated_at = time.time()
+            self._emit_task_event(task, "failed")
 
     def _mark_stopped(self, task):
         with self.lock:
@@ -221,11 +244,13 @@ class AdaptTaskManager:
                 return
             task.status = TaskStatus.STOPPED
             task.updated_at = time.time()
+            self._emit_task_event(task, "stopped")
 
     def _mark_destroyed(self, task):
         with self.lock:
             task.status = TaskStatus.DESTROYED
             task.updated_at = time.time()
+            self._emit_task_event(task, "destroyed")
 
     def _run_task(self, task_id):
         with self.lock:
@@ -240,6 +265,7 @@ class AdaptTaskManager:
                     return
                 task.status = TaskStatus.RUNNING
                 task.updated_at = time.time()
+                self._emit_task_event(task, "running")
 
             try:
                 result = process_story_dir(
@@ -274,6 +300,7 @@ class AdaptTaskManager:
                     if task.status != TaskStatus.DESTROYED:
                         task.status = TaskStatus.COMPLETED
                         task.updated_at = time.time()
+                        self._emit_task_event(task, "completed")
                 return
             except Exception as exc:
                 is_retryable_api_error = self._is_retryable_api_error(exc)
@@ -285,7 +312,8 @@ class AdaptTaskManager:
                         task.status = TaskStatus.PUBLISHED
                         task.error = f"AI API 连接失败，第{attempt}次重试: {exc}"
                         task.updated_at = time.time()
-                    backoff_seconds = min(2 ** (attempt - 1), 8)
+                        self._emit_task_event(task, "api_retry")
+                    backoff_seconds = min(2 ** (attempt - 1), 60)
                     is_cancelled = task.cancel_event.wait(backoff_seconds)
                     if is_cancelled:
                         self._mark_stopped(task)
@@ -298,13 +326,27 @@ class AdaptTaskManager:
                 return
 
     def _is_retryable_api_error(self, exc):
-        if not isinstance(exc, AIAPIError):
+        error_text = str(exc).lower()
+        if "non_retryable" in error_text or "non-retryable" in error_text:
             return False
+        if isinstance(exc, AIAPIError):
+            return True # Assume AIAPIError is retryable or handled by llm_workflow
         cause = getattr(exc, "__cause__", None)
         if cause and cause.__class__.__name__ in {"APIConnectionError", "APITimeoutError"}:
             return True
         error_text = str(exc).lower()
-        return "connection" in error_text or "timeout" in error_text or "连接" in error_text
+        retryable_signals = [
+            "connection",
+            "timeout",
+            "timed out",
+            "连接",
+            "429",
+            "try again",
+            "remote disconnected",
+            "service unavailable",
+            "bad gateway",
+        ]
+        return any(signal in error_text for signal in retryable_signals)
 
     def _update_progress(self, task_id, payload):
         with self.lock:
@@ -320,8 +362,47 @@ class AdaptTaskManager:
                 task.completed_chapters = max(0, completed_chapters)
             if isinstance(current_chapter, str):
                 task.current_chapter = current_chapter
+            request_name = payload.get("request_name")
+            request_phase = payload.get("request_phase")
+            request_attempt = payload.get("request_attempt")
+            request_sleep_seconds = payload.get("request_sleep_seconds")
+            request_error = payload.get("request_error")
+            if isinstance(request_name, str):
+                task.request_name = request_name
+            if isinstance(request_phase, str):
+                task.request_phase = request_phase
+            if isinstance(request_attempt, int):
+                task.request_attempt = max(0, request_attempt)
+                task.api_retry_count = max(0, request_attempt - 1)
+            if isinstance(request_sleep_seconds, (int, float)):
+                task.request_sleep_seconds = max(0.0, float(request_sleep_seconds))
+            if isinstance(request_error, str) and request_error.strip():
+                task.error = request_error.strip()
             if task.pause_event.is_set() and task.status != TaskStatus.DESTROYED:
                 task.status = TaskStatus.PAUSED
             elif task.status in {TaskStatus.PUBLISHED, TaskStatus.PAUSED}:
                 task.status = TaskStatus.RUNNING
             task.updated_at = time.time()
+            self._emit_task_event(task, "progress")
+
+    def _emit_task_event(self, task, event_type):
+        self.event_queue.put(
+            {
+                "event_type": event_type,
+                "event_at": time.time(),
+                "task_id": task.task_id,
+                "story_folder": task.story_folder,
+                "story_dir": task.story_dir,
+                "status": task.status.value,
+                "total_chapters": task.total_chapters,
+                "completed_chapters": task.completed_chapters,
+                "current_chapter": task.current_chapter,
+                "error": task.error,
+                "api_retry_count": task.api_retry_count,
+                "api_retry_limit": task.api_retry_limit,
+                "request_name": task.request_name,
+                "request_phase": task.request_phase,
+                "request_attempt": task.request_attempt,
+                "request_sleep_seconds": task.request_sleep_seconds,
+            }
+        )

@@ -1,6 +1,7 @@
 import json
 import mimetypes
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,13 @@ class ToAPIsImageConfig:
     api_key: str
     model: str = "gemini-3-pro-image-preview"
     timeout: int = 60
+    max_concurrency: int = 4
+
+
+_CONCURRENCY_MIN = 1
+_CONCURRENCY_MAX = 4
+_toapis_semaphore_lock = threading.Lock()
+_toapis_semaphore_by_key: dict[tuple[str, str, str, int], threading.BoundedSemaphore] = {}
 
 
 def load_toapis_image_config(prefix: str = "TOAPIS_IMAGE") -> ToAPIsImageConfig:
@@ -27,6 +35,7 @@ def load_toapis_image_config(prefix: str = "TOAPIS_IMAGE") -> ToAPIsImageConfig:
     api_key = os.environ.get(f"{prefix}_KEY", "").strip()
     model = os.environ.get(f"{prefix}_MODEL", "gemini-3-pro-image-preview").strip()
     timeout_raw = os.environ.get(f"{prefix}_TIMEOUT", "60").strip()
+    max_concurrency_raw = os.environ.get(f"{prefix}_MAX_CONCURRENCY", "4").strip()
 
     if not api_key:
         raise ToAPIsImageError(f"缺少环境变量: {prefix}_KEY")
@@ -37,13 +46,34 @@ def load_toapis_image_config(prefix: str = "TOAPIS_IMAGE") -> ToAPIsImageConfig:
         timeout = int(timeout_raw)
     except ValueError as exc:
         raise ToAPIsImageError(f"环境变量 {prefix}_TIMEOUT 不是有效整数: {timeout_raw}") from exc
+    try:
+        max_concurrency = int(max_concurrency_raw)
+    except ValueError as exc:
+        raise ToAPIsImageError(
+            f"环境变量 {prefix}_MAX_CONCURRENCY 不是有效整数: {max_concurrency_raw}"
+        ) from exc
+    if max_concurrency < _CONCURRENCY_MIN or max_concurrency > _CONCURRENCY_MAX:
+        raise ToAPIsImageError(
+            f"环境变量 {prefix}_MAX_CONCURRENCY 必须在 {_CONCURRENCY_MIN}~{_CONCURRENCY_MAX} 之间: {max_concurrency}"
+        )
 
     return ToAPIsImageConfig(
         base_url=base_url,
         api_key=api_key,
         model=model,
         timeout=timeout,
+        max_concurrency=max_concurrency,
     )
+
+
+def _get_toapis_semaphore(config: ToAPIsImageConfig) -> threading.BoundedSemaphore:
+    key = (config.base_url, config.api_key, config.model, config.max_concurrency)
+    with _toapis_semaphore_lock:
+        semaphore = _toapis_semaphore_by_key.get(key)
+        if semaphore is None:
+            semaphore = threading.BoundedSemaphore(value=config.max_concurrency)
+            _toapis_semaphore_by_key[key] = semaphore
+    return semaphore
 
 
 def _request(
@@ -60,15 +90,20 @@ def _request(
     normalized_path = path if path.startswith("/") else f"/{path}"
     url = f"{config.base_url}{normalized_path}"
     request = Request(url=url, data=data, method=method.upper(), headers=current_headers)
+    semaphore = _get_toapis_semaphore(config)
 
+    semaphore.acquire()
     try:
-        with urlopen(request, timeout=config.timeout) as response:
-            body = response.read().decode("utf-8")
-    except HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise ToAPIsImageError(f"ToAPIs 请求失败: status={exc.code}, body={error_body}") from exc
-    except URLError as exc:
-        raise ToAPIsImageError(f"ToAPIs 连接失败: {exc}") from exc
+        try:
+            with urlopen(request, timeout=config.timeout) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise ToAPIsImageError(f"ToAPIs 请求失败: status={exc.code}, body={error_body}") from exc
+        except URLError as exc:
+            raise ToAPIsImageError(f"ToAPIs 连接失败: {exc}") from exc
+    finally:
+        semaphore.release()
 
     try:
         result = json.loads(body)

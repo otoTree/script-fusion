@@ -52,32 +52,31 @@ def run_batch(args, output_dir):
         _log(f"已发布任务 story={story_dir.name} task_id={task_id}")
     _log(f"总计发布任务数={len(task_ids)}")
     try:
-        last_log_ts = 0.0
-        while True:
-            tasks = manager.list_tasks()
-            status_counts = {}
-            for item in tasks:
-                status = item.get("status", "").lower()
-                status_counts[status] = status_counts.get(status, 0) + 1
-            active = [
-                item
-                for item in tasks
-                if item["status"]
-                in {
-                    TaskStatus.PUBLISHED.value,
-                    TaskStatus.RUNNING.value,
-                    TaskStatus.PAUSED.value,
-                    TaskStatus.STOPPING.value,
-                }
-            ]
-            now = time.time()
-            if now - last_log_ts >= max(0.2, args.poll_interval):
-                snapshot = " ".join([f"{k}={v}" for k, v in sorted(status_counts.items())]) or "无任务"
-                _log(f"状态快照: {snapshot}")
-                last_log_ts = now
-            if not active:
-                break
-            time.sleep(max(0.2, args.poll_interval))
+        terminal_events = {"completed", "failed", "stopped", "destroyed"}
+        remaining_task_ids = set(task_ids)
+        while remaining_task_ids:
+            event = manager.next_event(timeout=max(0.2, args.poll_interval))
+            if not event:
+                continue
+            task_id = event.get("task_id")
+            if task_id not in remaining_task_ids:
+                continue
+            _log(
+                "进行中: "
+                f"story={event.get('story_folder')} "
+                f"status={event.get('status')} "
+                f"event={event.get('event_type')} "
+                f"progress={event.get('completed_chapters', 0)}/{event.get('total_chapters', 0)} "
+                f"current={event.get('current_chapter') or '-'} "
+                f"req={event.get('request_name') or '-'} "
+                f"phase={event.get('request_phase') or '-'} "
+                f"attempt={event.get('request_attempt', 0)} "
+                f"sleep={event.get('request_sleep_seconds', 0.0)} "
+                f"retry={event.get('api_retry_count', 0)}/{event.get('api_retry_limit', 0)} "
+                f"error={event.get('error') or '-'}"
+            )
+            if event.get("event_type") in terminal_events:
+                remaining_task_ids.discard(task_id)
         task_map = {item["task_id"]: item for item in manager.list_tasks()}
     finally:
         manager.shutdown(cancel_running=False)
